@@ -72,6 +72,7 @@ RENDERABLE_TYPE                 :: 0x3040
 CONFORMANT                      :: 0x3042
 VENDOR                          :: 0x3053
 VERSION                         :: 0x3054
+EXTENSTIONS                     :: 0x3055
 HEIGHT                          :: 0x3056
 WIDTH                           :: 0x3057
 DRAW                            :: 0x3059

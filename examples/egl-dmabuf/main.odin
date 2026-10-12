@@ -1,4 +1,4 @@
-package dmabuf_ui
+package egl_dmabuf
 
 import wayl "../../"
 import wl "../../wl"
@@ -57,7 +57,6 @@ State :: struct {
 	gbm_device:                          gbm.Device,
 	zwp_linux_dmabuf:                    zwp.Linux_Dmabuf_V1,
 	dmabuf_feedback:                     Dmabuf_Feedback,
-  // gbo:                                 #soa[BUF_LEN]Gbo
 }
 
 BufferStatus :: enum {
@@ -84,7 +83,7 @@ Status :: enum {
 }
 
 
-BUF_LEN :: 4
+BUF_LEN :: 2
 GL_MAJOR :: 3
 GL_MINOR :: 3
 gbo: #soa[BUF_LEN]Gbo
@@ -263,7 +262,6 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 			}
 		case zwp.Linux_Dmabuf_Feedback_V1_Tranche_Done_Event:
 			append(&st.dmabuf_feedback.tranches, st.dmabuf_feedback.current)
-			log.debug(st.dmabuf_feedback.current.target_device, st.dmabuf_feedback.current.flags)
 			// reset scratch state for next tranche
 			st.dmabuf_feedback.current = {}
 		case zwp.Linux_Dmabuf_Feedback_V1_Done_Event:
@@ -345,7 +343,6 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	}
 
 	assert(st.wl_surface != 0)
-	egl.BindAPI(egl.OPENGL_API)
 
 	st.egl_display = egl.GetPlatformDisplay(.GBM_KHR, st.gbm_device, nil)
 	if st.egl_display == egl.NO_DISPLAY {
@@ -360,7 +357,7 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	}
 	log.infof("EGLv%i.%i Initialized", major, minor)
 
-	extensions := string(egl.QueryString(st.egl_display, 0x3055))
+	extensions := string(egl.QueryString(st.egl_display, egl.EXTENSTIONS))
 
 	if extensions == "" {
 		log.error("eglQueryString(EGL_EXTENSIONS) returned empty")
@@ -380,7 +377,6 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	if !has_no_config {
 		log.warn("EGL_KHR_no_config_context not supported")
 		config_attribs := []i32 {
-			egl.SURFACE_TYPE,    egl.WINDOW_BIT,
 			egl.RENDERABLE_TYPE, egl.OPENGL_BIT,
 			egl.RED_SIZE,        8,
 			egl.GREEN_SIZE,      8,
@@ -403,7 +399,6 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 		}
 		log.debug("configs matched: ", num_configs)
 
-		egl_config: egl.Config
 		found := false
 		for i in 0 ..< num_configs {
 			visual_id: i32
@@ -466,14 +461,15 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	log.infof("OpenGL %s", gl.GetString(gl.VERSION))
 	log.infof("Renderer: %s", gl.GetString(gl.RENDERER))
 
-	gl.Viewport(0, 0, i32(st.w), i32(st.h))
-
-	gl.Disable(gl.BLEND)
-
 	log.info("\n========= OPENGL READY ============\n")
 	return true
 }
-
+// Creates surfaceless egl context ( see https://fossies.org/linux/weston/clients/simple-egl.c)
+// for reference implementation. There is a simpler method using EGLSurface on a gbm_surface presented
+// wth eglSwapBuffers then gbm_surface_lock_front_buffer. This gives Mesa control of the buffer queue, modifiers,
+// and buffer lifetimes, and releases you from managing the swapchain. In the process of debugging, DO NOT EVER call
+// connection_poll or receive_events for zwp.linux_buffer_params_v1_create buffers one at a time, the author made a
+// switch to surfaceless and saw no reason to attempt going back afterwards.
 create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> bool {
 	format := gbm.Formats.XRGB8888
 
@@ -619,15 +615,11 @@ create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> boo
 	}
 
 	for plane in 0 ..< plane_count {
-		attribs[i] = plane_fd_attrs[plane];     i += 1; attribs[i] = i32(plane_fds[plane]); i += 1
-		attribs[i] = plane_offset_attrs[plane]; i += 1; attribs[i] = i32(offsets[plane]);   i += 1
-		attribs[i] = plane_pitch_attrs[plane];  i += 1; attribs[i] = i32(strides[plane]);   i += 1
-		if egl.QueryDmaBufModifiersEXT != nil {
-			attribs[i] =
-				plane_mod_lo_attrs[plane]; i += 1; attribs[i] = i32(modifier & 0xFFFFFFFF); i += 1
-			attribs[i] =
-				plane_mod_hi_attrs[plane]; i += 1; attribs[i] = i32(modifier >> 32); i += 1
-		}
+		attribs[i] = plane_fd_attrs[plane];     i += 1; attribs[i] = i32(plane_fds[plane]);      i += 1
+		attribs[i] = plane_offset_attrs[plane]; i += 1; attribs[i] = i32(offsets[plane]);        i += 1
+		attribs[i] = plane_pitch_attrs[plane];  i += 1; attribs[i] = i32(strides[plane]);        i += 1
+		attribs[i] = plane_mod_lo_attrs[plane]; i += 1; attribs[i] = i32(modifier & 0xFFFFFFFF); i += 1
+		attribs[i] = plane_mod_hi_attrs[plane]; i += 1; attribs[i] = i32(modifier >> 32);        i += 1
 	}
 	attribs[i] = egl.NONE
 
@@ -686,14 +678,16 @@ quit :: proc(conn: ^wl.Connection, state: State) {
 	wayl.connection_flush(conn)
 	wayl.connection_destroy(conn^)
 
-	delete(state.dmabuf_feedback.current.formats)
+	for t in state.dmabuf_feedback.tranches {
+  	delete(t.formats)
+	}
 	delete(state.dmabuf_feedback.format_table)
 	delete(state.dmabuf_feedback.tranches)
 
 	linux.close(conn.socket)
 	log.info("closed safely")
 }
-elapsed :f32= 0
+tick := 0
 draw :: proc(conn: ^wl.Connection, st: ^State) {
 	slot, ok := window_next_buffer()
 	if !ok do return 
@@ -701,7 +695,9 @@ draw :: proc(conn: ^wl.Connection, st: ^State) {
 	gl.BindFramebuffer(gl.FRAMEBUFFER, gbo[slot].gl_fbo)
 	gl.Viewport(0, 0, i32(st.w), i32(st.h))
 
-	gl.ClearColor(0.98, 0.67, 0.17, 1)
+	shade := f32(tick % 120) / 120
+	gl.ClearColor(shade, 0.67, 1-shade, 1)
+	tick += 1
 	gl.Clear(gl.COLOR_BUFFER_BIT)
 	gl.Flush()
 
