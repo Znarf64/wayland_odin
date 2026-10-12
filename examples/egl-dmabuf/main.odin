@@ -1,9 +1,9 @@
-#+build linux
-#+feature using-stmt
 package dmabuf_ui
 
-import app "../app"
-import ui "../ui"
+import wayl "../../"
+import wl "../../wl"
+import xdg "../../xdg"
+import zwp "../../zwp"
 import "core:fmt"
 import "core:log"
 import "core:mem"
@@ -12,11 +12,10 @@ import "core:sys/linux"
 import "egl"
 import "gbm"
 import gl "vendor:OpenGL"
-import wayl "../../"
-import wl "../../wl"
-import wp "../../wp"
-import xdg "../../xdg"
-import zwp "../../zwp"
+
+
+WL_DBG :: #config(WL_DBG, false)
+
 
 Dmabuf_Format_Modifier :: struct {
 	format:   u32,
@@ -36,49 +35,29 @@ Dmabuf_Feedback :: struct {
 	current:      Dmabuf_Tranche,
 }
 
-MAX_POOL_SIZE :: app.BUF_WIDTH * app.BUF_HEIGHT * 4 * 4
-BUF_LEN :: 4
 State :: struct {
-	buffer_size, stride, w, h:           u32,
-	tick:                                u32,
-	keymap, use_software, should_redraw: bool,
+	w, h:           u32,
+	should_redraw: bool,
 	status:                              Status,
 
 	// WL
 	wl_registry:                         wl.Registry,
-	wl_buffer:                           [BUF_LEN]wl.Buffer,
 	xdg_wm_base:                         xdg.Wm_Base,
 	xdg_surface:                         xdg.Surface,
 	wl_surface:                          wl.Surface,
-	surface_callback:                    wl.Callback,
 	wl_compositor:                       wl.Compositor,
 	xdg_toplevel:                        xdg.Toplevel,
-	wl_seat:                             wl.Seat,
-	wl_pointer:                          wl.Pointer,
-	wl_keyboard:                         wl.Keyboard,
-	data_device_manager:                 wl.Data_Device_Manager,
-	data_source:                         wl.Data_Source,
-	cursor_shape_manager:                wp.Cursor_Shape_Manager_V1,
 
 	// EGL
 	egl_display:                         egl.Display,
-	egl_surface:                         egl.Surface,
 	egl_context:                         egl.Context,
 
 	// GBM
 	drm_fd:                              linux.Fd,
 	gbm_device:                          gbm.Device,
-	gbm_surface:                         gbm.Surface,
 	zwp_linux_dmabuf:                    zwp.Linux_Dmabuf_V1,
-	prog2d:                              Program2D,
-
-	// SHM
-	shm_fd:                              linux.Fd,
-	wl_shm:                              wl.Shm,
-	wl_shm_pool:                         wl.Shm_Pool,
-	shm_pool_data:                       []u8,
 	dmabuf_feedback:                     Dmabuf_Feedback,
-	app:                                 app.State,
+  // gbo:                                 #soa[BUF_LEN]Gbo
 }
 
 BufferStatus :: enum {
@@ -87,6 +66,7 @@ BufferStatus :: enum {
 	Busy,
 	Ready,
 }
+
 Gbo :: struct {
 	bo:         gbm.BufferObject,
 	status:     BufferStatus,
@@ -97,70 +77,19 @@ Gbo :: struct {
 	plane_fds:  [4]linux.Fd,
 	zwp_params: zwp.Linux_Buffer_Params_V1,
 }
-gbo: #soa[BUF_LEN]Gbo
 
-Error :: enum {
-	None,
-	Crash,
-	NoWayland,
-}
 Status :: enum {
 	None,
 	SurfaceAckedConfigure,
-	SurfaceAttached,
 }
-GL :: #config(GL, true)
-WL_DBG :: #config(WL_DBG, false)
 
 
-
-n: int = 0
-draw :: proc(conn: ^wl.Connection, st: ^State, i: u32) {
-	fmt.println(n, "====================DRAW====================")
-	n = 1 + n
-	if st.use_software {
-		if !st.should_redraw do return
-		i := i % len(st.wl_buffer)
-		wl.surface_frame(conn, st.wl_surface)
-		app.update_render(st.shm_pool_data[((i)) * st.buffer_size:][:st.buffer_size], st.w, st.h)
-		wl.surface_attach(conn, st.wl_surface, st.wl_buffer[i], 0, 0)
-		wl.surface_damage_buffer(conn, st.wl_surface, 0, 0, i32(st.w), i32(st.h))
-		st.keymap
-		wl.surface_commit(conn, st.wl_surface)
-		st.should_redraw = false
-		return
-	}
-
-	slot, ok := window_next_buffer()
-	if !ok {
-		log.warn("all buffers busy, skipping frame")
-		return
-	}
-
-	gl.BindFramebuffer(gl.FRAMEBUFFER, gbo[slot].gl_fbo)
-	gl.Viewport(0, 0, i32(st.w), i32(st.h))
-
-	utx: ui.Context
-	size: [2]f32 = {f32(st.w), f32(st.h)}
-	if ui.start(&utx, size) {
-		app.make_ui(&utx, &st.app)
-	}
-	rr_frame(&utx, &st.prog2d, size)
-	gl.Flush()
+BUF_LEN :: 4
+GL_MAJOR :: 3
+GL_MINOR :: 3
+gbo: #soa[BUF_LEN]Gbo
 
 
-	fmt.println(n, "====================PRESENT====================")
-
-	wl.surface_frame(conn, st.wl_surface)
-	wl.surface_attach(conn, st.wl_surface, gbo[slot].buffer, 0, 0)
-	wl.surface_damage_buffer(conn, st.wl_surface, 0, 0, i32(st.w), i32(st.h))
-	wl.surface_commit(conn, st.wl_surface)
-
-	gbo[slot].status = .Busy
-	st.should_redraw = false
-	fmt.println(n, "====================END DRAW====================")
-
-}
 window_next_buffer :: proc() -> (slot: int, ok: bool) {
 	for &g, i in gbo {
 		if g.status == .Ready do return i, true
@@ -168,59 +97,46 @@ window_next_buffer :: proc() -> (slot: int, ok: bool) {
 	return -1, false
 }
 
-create_objects :: proc(conn: ^wl.Connection, st: ^State) -> linux.Errno {
-	wayl.connection_flush(conn) or_return
-	wayl.connection_poll(conn)
-	if exit := receive_events(conn, st); exit do return .NONE
+create_buffers :: proc(conn: ^wl.Connection, st: ^State) -> bool {
+	for slot in 0 ..< BUF_LEN {
+		if !create_dmabuf_buffer(conn, st, slot) {
+			log.error("failed to create buffer at slot", slot)
+			return false
+		}
+	}
+	return true
+}
 
-	assert(st.wl_compositor != 0)
+create_objects :: proc(conn: ^wl.Connection, st: ^State) -> (ok: bool) {
+	wayl.connection_flush(conn)
+	wayl.connection_poll(conn)
+	if exit := receive_events(conn, st); exit do return true
+
 	assert(st.xdg_wm_base != 0)
-	assert(st.wl_seat != 0)
 
 	st.wl_surface = wl.compositor_create_surface(conn, st.wl_compositor)
 	st.xdg_surface = xdg.wm_base_get_xdg_surface(conn, st.xdg_wm_base, st.wl_surface)
 	st.xdg_toplevel = xdg.surface_get_toplevel(conn, st.xdg_surface)
-	st.wl_keyboard = wl.seat_get_keyboard(conn, st.wl_seat)
-	st.wl_pointer = wl.seat_get_pointer(conn, st.wl_seat)
 
-	xdg.toplevel_set_title(conn, st.xdg_toplevel, app.TITLE)
-	xdg.toplevel_set_app_id(conn, st.xdg_toplevel, app.APP_ID)
+	xdg.toplevel_set_title(conn, st.xdg_toplevel, "egl-dmabuf")
+	xdg.toplevel_set_app_id(conn, st.xdg_toplevel, "egl-dmabuf")
 	wl.surface_commit(conn, st.wl_surface)
 	if st.zwp_linux_dmabuf != 0 {
 		zwp.linux_dmabuf_v1_get_surface_feedback(conn, st.zwp_linux_dmabuf, st.wl_surface)
 	}
 
-	wayl.connection_flush(conn) or_return
+	wayl.connection_flush(conn)
 	wayl.connection_poll(conn)
-	if exit := receive_events(conn, st); exit do return .NONE
+	if exit := receive_events(conn, st); exit do return true
 
-	if st.use_software {
-		using st
-		if wl_shm != 0 && wl_shm_pool == 0 && wl_buffer == 0 {
-			wl_shm_pool = wl.shm_create_pool(conn, wl_shm, auto_cast shm_fd, i32(MAX_POOL_SIZE))
-			for &b, i in wl_buffer {
-				b = wl.shm_pool_create_buffer(
-					conn,
-					wl_shm_pool,
-					i32(u32(i) * buffer_size),
-					i32(w),
-					i32(h),
-					i32(stride),
-					.Argb8888,
-				)
-			}
-			assert(len(shm_pool_data) != 0)
-			assert(buffer_size != 0)
-		}
-	} else {
-		if !create_display_hw(conn, st) {
-			log.error("Error in GL creation")
-			return .EADV
-		}
-		create_err := create_window(conn, st)
-		if !create_err do return .EIO
+	if !create_display(conn, st) {
+		log.error("Error in GL creation")
+		return false
 	}
-	return .NONE
+	create_err := create_buffers(conn, st)
+	if !create_err do return false
+
+	return true
 }
 
 connect_display :: proc() -> (conn: wl.Connection, display: wl.Display, ok: bool) {
@@ -248,27 +164,9 @@ connect_display :: proc() -> (conn: wl.Connection, display: wl.Display, ok: bool
 			}
 		},
 	)
-	// conn.object_types = make([dynamic]wl.Object_Type, 2)
-	// conn.object_types[1] = .Display
 
 	return conn, display, true
 }
-
-create_shm_file :: proc(fb: ^[]u8, size: u32) -> (shm_fd: linux.Fd, err: linux.Errno) {
-	shm_fd = linux.Fd(
-		linux.syscall(linux.SYS_memfd_create, transmute(^u8)(cstring("wayland-shm")), 1),
-	)
-	// shm_fd = memfd_create("wayland-shm") or_return
-	linux.ftruncate(shm_fd, i64(size)) or_return
-	shm_ptr, mmap_err := linux.mmap(0, uint(size), {.READ, .WRITE}, {.SHARED}, shm_fd)
-	if mmap_err != .NONE {
-		linux.close(shm_fd)
-		return 0, mmap_err
-	}
-	fb^ = mem.slice_ptr(cast(^byte)shm_ptr, int(size))
-	return shm_fd, .NONE
-}
-
 
 @(private)
 receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
@@ -276,17 +174,6 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 		#partial switch e in ev {
 		case wl.Registry_Global_Event:
 			switch e.interface {
-			case wl.SHM_INTERFACE:
-				if st.use_software {
-					st.wl_shm = wl.registry_bind(
-						conn,
-						st.wl_registry,
-						e.name,
-						e.interface,
-						e.version,
-						wl.Shm,
-					)
-				}
 			case xdg.WM_BASE_INTERFACE:
 				st.xdg_wm_base = wl.registry_bind(
 					conn,
@@ -305,15 +192,6 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 					e.version,
 					wl.Compositor,
 				)
-			case wl.SEAT_INTERFACE:
-				st.wl_seat = wl.registry_bind(
-					conn,
-					st.wl_registry,
-					e.name,
-					e.interface,
-					e.version,
-					wl.Seat,
-				)
 			case zwp.LINUX_DMABUF_V1_INTERFACE:
 				st.zwp_linux_dmabuf = wl.registry_bind(
 					conn,
@@ -323,7 +201,6 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 					e.version,
 					zwp.Linux_Dmabuf_V1,
 				)
-			// zwp_linux_dmabuf_v1_get_default_feedback(conn, st.zwp_linux_dmabuf)
 			}
 		case wl.Display_Error_Event:
 			log.error("[ERROR] code:", e.code, "::", e.object_id, e.message)
@@ -332,39 +209,9 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 		case xdg.Surface_Configure_Event:
 			xdg.surface_ack_configure(conn, st.xdg_surface, e.serial)
 			st.status = .SurfaceAckedConfigure
-		case wl.Shm_Format_Event:
-			if e.format == .Argb8888 {
-				fmt.println("ARGB8888 supported by compositor!")
-			}
-		case xdg.Toplevel_Configure_Event:
-			if st.use_software {
-				if e.height == 0 || e.width == 0 do break
-				if st.wl_buffer != 0 && i32(st.buffer_size) != e.height * e.width * 4 {
-					resize_pool(st, e.width, e.height)
-					for &b, i in st.wl_buffer {
-						if b != 0 do wl.buffer_destroy(conn, b)
-						b = wl.shm_pool_create_buffer(
-							conn,
-							st.wl_shm_pool,
-							i32(i) * i32(st.buffer_size),
-							i32(st.w),
-							i32(st.h),
-							i32(st.stride),
-							.Argb8888,
-						)
-					}
-					st.status = .None
-				}
-				if (st.wl_shm_pool != 0 && st.buffer_size * 2 > MAX_POOL_SIZE) {
-					wl.shm_pool_resize(conn, st.wl_shm_pool, i32(st.buffer_size))
-				}
-			}
 		case xdg.Toplevel_Close_Event:
 			return true
 		case wl.Callback_Done_Event:
-			log.info("wl.Callback_Done_Event")
-			when ODIN_DEBUG do log.infof("%ims", e.callback_data - st.tick)
-			st.tick = e.callback_data
 			st.should_redraw = true
 		case xdg.Toplevel_Configure_Bounds_Event:
 		case xdg.Toplevel_Wm_Capabilities_Event:
@@ -376,7 +223,6 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 					break
 				}
 			}
-
 		case zwp.Linux_Dmabuf_Feedback_V1_Main_Device_Event:
 			clear(&st.dmabuf_feedback.tranches)
 			copy(st.dmabuf_feedback.main_device[:], e.device[:])
@@ -426,24 +272,6 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 				len(st.dmabuf_feedback.tranches),
 				"tranches ===",
 			)
-
-		case wl.Seat_Capabilities_Event:
-			capabilities := e.capabilities
-		case wl.Seat_Name_Event:
-		case wl.Keyboard_Keymap_Event:
-			assert(e.format == .Xkb_V1)
-			fd: linux.Fd = auto_cast e.fd
-			if (!st.keymap) {
-				if ptr, err := linux.mmap(0, uint(e.size), {.READ}, {.PRIVATE}, fd); err != .NONE {
-					log.error("mmap failed, ", err)
-					linux.close(fd)
-					return false
-				} else {
-					st.keymap = true
-					linux.munmap(ptr, uint(e.size))
-				}
-				linux.close(fd)
-			}
 		case zwp.Linux_Buffer_Params_V1_Created_Event:
 			found := false
 			for &b in gbo {
@@ -479,38 +307,6 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 	return false
 }
 
-resize_pool :: proc(state: ^State, w, h: i32) {
-	state.w = auto_cast w
-	state.h = auto_cast h
-	state.stride = state.w * 4
-	state.buffer_size = state.stride * state.h
-}
-
-quit :: proc(conn: ^wl.Connection, state: State) {
-	// TODO: Single destroy command for any wl.object
-	for b in state.wl_buffer {
-		if b != 0 do wl.buffer_destroy(conn, b)
-	}
-	if state.wl_shm_pool != 0 do wl.shm_pool_destroy(conn, state.wl_shm_pool)
-	if state.xdg_toplevel != 0 do xdg.toplevel_destroy(conn, state.xdg_toplevel)
-	if state.xdg_surface != 0 do xdg.surface_destroy(conn, state.xdg_surface)
-	if state.wl_surface != 0 do wl.surface_destroy(conn, state.wl_surface)
-	if state.wl_seat != 0 do wl.seat_release(conn, state.wl_seat)
-	if state.wl_keyboard != 0 do wl.keyboard_release(conn, state.wl_keyboard)
-	if state.wl_pointer != 0 do wl.pointer_release(conn, state.wl_pointer)
-	wayl.connection_flush(conn)
-	if len(state.shm_pool_data) > 0 {
-		linux.munmap(raw_data(state.shm_pool_data), len(state.shm_pool_data))
-	}
-	linux.close(state.shm_fd)
-	linux.close(conn.socket)
-	// delete(conn.object_types)
-	delete(conn.fds_in)
-	delete(conn.fds_out)
-	delete(conn.free_ids)
-	log.info("closed safely")
-	// bytes.buffer_destroy(&conn.buffer)
-}
 
 open_drm_device :: proc() -> (fd: linux.Fd, ok: bool) {
 	render_nodes := []cstring {
@@ -523,7 +319,7 @@ open_drm_device :: proc() -> (fd: linux.Fd, ok: bool) {
 	for node in render_nodes {
 		fd_int, err := linux.open(node, {.RDWR}, {})
 		if err == .NONE {
-			log.debugf("Opened DRM device: %s", node)
+			log.debug("Opened DRM device: ", node)
 			return linux.Fd(fd_int), true
 		}
 	}
@@ -539,7 +335,8 @@ open_drm_device :: proc() -> (fd: linux.Fd, ok: bool) {
  */
 
 // https://registry.khronos.org/EGL/sdk/docs/man/html/eglIntro.xhtml
-create_display_hw :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
+
+create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	st.drm_fd = open_drm_device() or_return
 	st.gbm_device = gbm.create_device(st.drm_fd)
 	if st.gbm_device == {} {
@@ -583,16 +380,11 @@ create_display_hw :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	if !has_no_config {
 		log.warn("EGL_KHR_no_config_context not supported")
 		config_attribs := []i32 {
-			egl.SURFACE_TYPE,
-			egl.WINDOW_BIT,
-			egl.RENDERABLE_TYPE,
-			egl.OPENGL_BIT,
-			egl.RED_SIZE,
-			8,
-			egl.GREEN_SIZE,
-			8,
-			egl.BLUE_SIZE,
-			8,
+			egl.SURFACE_TYPE,    egl.WINDOW_BIT,
+			egl.RENDERABLE_TYPE, egl.OPENGL_BIT,
+			egl.RED_SIZE,        8,
+			egl.GREEN_SIZE,      8,
+			egl.BLUE_SIZE,       8,
 			egl.NONE,
 		}
 		MAX_CONFIGS :: 256
@@ -634,10 +426,8 @@ create_display_hw :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	}
 
 	context_attribs := []i32 {
-		egl.CONTEXT_MAJOR_VERSION,
-		GL_MAJOR,
-		egl.CONTEXT_MINOR_VERSION,
-		GL_MINOR,
+		egl.CONTEXT_MAJOR_VERSION, GL_MAJOR,
+		egl.CONTEXT_MINOR_VERSION, GL_MINOR,
 		egl.NONE,
 	}
 
@@ -672,67 +462,16 @@ create_display_hw :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	   egl.QueryDmaBufModifiersEXT == nil {
 		log.warn("EGL_EXT_image_dma_buf_import_modifiers advertised but proc load failed")
 	}
-
-
-	// st.egl_surface = egl.CreatePlatformWindowSurface(st.egl_display, egl_config, gbm_surface, {})
-	// if (st.egl_surface == egl.NO_SURFACE) {
-	// 	log.error("egl_surface creation failed:", egl.get_error())
-	// 	return false
-	// }
-
-	// if !egl.MakeCurrent(st.egl_display, st.egl_surface, st.egl_surface, st.egl_context) {
-	// 	log.error("Failed to make egl context current:", egl.get_error())
-	// 	return false
-	// }
-	// w, h: i32
-	// egl.QuerySurface(st.egl_display, st.egl_surface, egl.WIDTH, &w)
-	// egl.QuerySurface(st.egl_display, st.egl_surface, egl.HEIGHT, &h)
-	// assert(u32(w) == st.w)
-	// log.debugf("EGL Context Current. size:%ix%i:", w, h)
-
-	// st.gbm_device = gbm_device
-	// st.gbm_surface = gbm_surface
-
 	gl.load_up_to(GL_MAJOR, GL_MINOR, egl.set_proc_address)
 	log.infof("OpenGL %s", gl.GetString(gl.VERSION))
 	log.infof("Renderer: %s", gl.GetString(gl.RENDERER))
 
-	// gl.Viewport(0, 0, i32(st.w), i32(st.h))
-	if prog2d, ok := rr_make_program(); ok {
-		st.prog2d = prog2d
-	} else {
-		log.error("failed to initialize shader program")
-		return false
-	}
+	gl.Viewport(0, 0, i32(st.w), i32(st.h))
+
 	gl.Disable(gl.BLEND)
 
 	log.info("\n========= OPENGL READY ============\n")
 	return true
-}
-
-create_window :: proc(conn: ^wl.Connection, st: ^State) -> bool {
-	for slot in 0 ..< BUF_LEN {
-		if !create_dmabuf_buffer(conn, st, slot) {
-			log.error("create_window: failed to create buffer at slot", slot)
-			return false
-		}
-	}
-	return true
-}
-
-is_ccs_modifier :: proc(mod: u64) -> bool {
-	// Intel CCS modifiers
-	I915_FORMAT_MOD_Y_TILED_CCS :: 0x0100000000000002
-	I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS :: 0x0100000000000004
-	I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS :: 0x0100000000000005
-	I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC :: 0x0100000000000006
-
-	return(
-		mod == I915_FORMAT_MOD_Y_TILED_CCS ||
-		mod == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS ||
-		mod == I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS ||
-		mod == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC \
-	)
 }
 
 create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> bool {
@@ -752,30 +491,27 @@ create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> boo
 	// egl intersection
 	egl_mods: [dynamic]u64
 	defer delete(egl_mods)
-	if egl.QueryDmaBufModifiersEXT != nil {
-		max_mods: i32 = 64
-		egl_mod_array: [64]u64
-		num_egl_mods: i32
-		egl.QueryDmaBufModifiersEXT(
-			st.egl_display,
-			i32(format),
-			max_mods,
-			&egl_mod_array[0],
-			nil,
-			&num_egl_mods,
-		)
+	assert(egl.QueryDmaBufModifiersEXT != nil)
+	
+	max_mods: i32 = 64
+	egl_mod_array: [64]u64
+	num_egl_mods: i32
+	egl.QueryDmaBufModifiersEXT(
+		st.egl_display,
+		i32(format),
+		max_mods,
+		&egl_mod_array[0],
+		nil,
+		&num_egl_mods,
+	)
 
-		for comp_mod in mods {
-			for egl_mod in egl_mod_array[:num_egl_mods] {
-				if comp_mod == egl_mod {
-					append(&egl_mods, comp_mod)
-					break
-				}
+	for comp_mod in mods {
+		for egl_mod in egl_mod_array[:num_egl_mods] {
+			if comp_mod == egl_mod {
+				append(&egl_mods, comp_mod)
+				break
 			}
 		}
-	} else {
-		assert(false)
-		// append(&egl_mods, gbm.XDG_RUNTIME_DIR)
 	}
 
 	bo: gbm.BufferObject
@@ -790,6 +526,7 @@ create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> boo
 			{.USE_RENDERING},
 		)
 	}
+
 	if bo == {} {
 		bo = gbm.bo_create(st.gbm_device, st.w, st.h, format, {.USE_RENDERING})
 	}
@@ -846,8 +583,8 @@ create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> boo
 	// --- EGLImage import, using the SAME fds just sent to the compositor ---
 	attribs: [6 + 4 * 10 + 1]i32
 	i := 0
-	attribs[i] = egl.WIDTH; i += 1; attribs[i] = i32(st.w); i += 1
-	attribs[i] = egl.HEIGHT; i += 1; attribs[i] = i32(st.h); i += 1
+	attribs[i] = egl.WIDTH;                i += 1; attribs[i] = i32(st.w);   i += 1
+	attribs[i] = egl.HEIGHT;               i += 1; attribs[i] = i32(st.h);   i += 1
 	attribs[i] = egl.LINUX_DRM_FOURCC_EXT; i += 1; attribs[i] = i32(format); i += 1
 
 	plane_fd_attrs := [4]i32 {
@@ -882,9 +619,9 @@ create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> boo
 	}
 
 	for plane in 0 ..< plane_count {
-		attribs[i] = plane_fd_attrs[plane]; i += 1; attribs[i] = i32(plane_fds[plane]); i += 1
-		attribs[i] = plane_offset_attrs[plane]; i += 1; attribs[i] = i32(offsets[plane]); i += 1
-		attribs[i] = plane_pitch_attrs[plane]; i += 1; attribs[i] = i32(strides[plane]); i += 1
+		attribs[i] = plane_fd_attrs[plane];     i += 1; attribs[i] = i32(plane_fds[plane]); i += 1
+		attribs[i] = plane_offset_attrs[plane]; i += 1; attribs[i] = i32(offsets[plane]);   i += 1
+		attribs[i] = plane_pitch_attrs[plane];  i += 1; attribs[i] = i32(strides[plane]);   i += 1
 		if egl.QueryDmaBufModifiersEXT != nil {
 			attribs[i] =
 				plane_mod_lo_attrs[plane]; i += 1; attribs[i] = i32(modifier & 0xFFFFFFFF); i += 1
@@ -913,7 +650,8 @@ create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> boo
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-	gl.ClipControl(gl.UPPER_LEFT, gl.ZERO_TO_ONE)
+	// inverts y coordinate to top-down. available on opengl > 4.5
+	// gl.ClipControl(gl.UPPER_LEFT, gl.ZERO_TO_ONE)
 	egl.EGLImageTargetTexture2DOES(gl.TEXTURE_2D, image)
 
 	gl.GenFramebuffers(1, &fbo)
@@ -940,55 +678,98 @@ create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> boo
 	return true
 }
 
-main :: proc() -> Error {
-  conn, display, ok := connect_display()
-	if !ok do return .NoWayland
+quit :: proc(conn: ^wl.Connection, state: State) {
+	if state.xdg_toplevel != 0 do xdg.toplevel_destroy(conn, state.xdg_toplevel)
+	if state.xdg_surface != 0 do xdg.surface_destroy(conn, state.xdg_surface)
+	if state.wl_surface != 0 do wl.surface_destroy(conn, state.wl_surface)
+
+	wayl.connection_flush(conn)
+	wayl.connection_destroy(conn^)
+
+	delete(state.dmabuf_feedback.current.formats)
+	delete(state.dmabuf_feedback.format_table)
+	delete(state.dmabuf_feedback.tranches)
+
+	linux.close(conn.socket)
+	log.info("closed safely")
+}
+elapsed :f32= 0
+draw :: proc(conn: ^wl.Connection, st: ^State) {
+	slot, ok := window_next_buffer()
+	if !ok do return 
+
+	gl.BindFramebuffer(gl.FRAMEBUFFER, gbo[slot].gl_fbo)
+	gl.Viewport(0, 0, i32(st.w), i32(st.h))
+
+	gl.ClearColor(0.98, 0.67, 0.17, 1)
+	gl.Clear(gl.COLOR_BUFFER_BIT)
+	gl.Flush()
+
+	wl.surface_frame(conn, st.wl_surface)
+	wl.surface_attach(conn, st.wl_surface, gbo[slot].buffer, 0, 0)
+	wl.surface_damage_buffer(conn, st.wl_surface, 0, 0, i32(st.w), i32(st.h))
+	wl.surface_commit(conn, st.wl_surface)
+
+	gbo[slot].status = .Busy
+	st.should_redraw = false
+}
+
+start :: proc() {
+	conn, display, ok := connect_display()
+	if !ok {
+		log.error("Could not connect to wayland socket")
+		return
+	}
+
 	st := State {
 		wl_registry   = wl.display_get_registry(&conn, display),
 		w             = 500,
 		h             = 500,
-		use_software  = !GL,
 		should_redraw = true,
 	}
-
-	st.stride = st.w * 4
-	if st.use_software {
-		st.buffer_size = st.stride * st.h
-
-		shm_fd, shm_err := create_shm_file(&st.shm_pool_data, MAX_POOL_SIZE)
-		if shm_err != .NONE {
-			return .Crash
-		}
-		st.shm_fd = shm_fd
-	}
 	defer quit(&conn, st)
-	if err := create_objects(&conn, &st); err != .NONE {
-		log.error("Initial object creation failed", err)
-		return .Crash
-	}
-	log.info("Initial object creation passed")
-	log.info("Entering main loop")
 
-	i: u8 = 0
+	if !create_objects(&conn, &st) {
+		log.error("Initial object creation failed")
+		return
+	}
+
+	log.info("Initial object creation complete.\nEntering main loop.")
+
 	m: for {
-		if err := wayl.connection_flush(&conn); err != .NONE {
-			log.error("FLUSH Error:", err)
-			receive_events(&conn, &st)
-			return .Crash
+		wayl.connection_flush(&conn)
+	
+		if ready, _ := linux.poll({linux.Poll_Fd{fd = conn.socket, events = {.IN}}}, 2); ready > 0 {
+			wayl.connection_poll(&conn)
+			if receive_events(&conn, &st) do return
 		}
-
-		{
-			result, _ := linux.poll({linux.Poll_Fd{fd = conn.socket, events = {.IN}}}, 2)
-			if result > 0 {
-				wayl.connection_poll(&conn)
-				if exit := receive_events(&conn, &st); exit do return .None
-				// conn.data_cursor = 0
-				// conn.data = {}
-			}
-		}
+	
 		if st.status == .None do continue
-		if st.should_redraw do draw(&conn, &st, u32(i))
-		i += 1
+		if st.should_redraw do draw(&conn, &st)
 	}
-	return .None
+}
+
+main :: proc() {
+  context.logger = log.create_console_logger()
+	when ODIN_DEBUG {
+  	track: mem.Tracking_Allocator
+  	mem.tracking_allocator_init(&track, context.allocator)
+  	context.allocator = mem.tracking_allocator(&track)
+  	defer {
+  		if len(track.allocation_map) > 0 {
+  			fmt.eprintf("=== %v allocations not freed: ===\n", len(track.allocation_map))
+  			for _, entry in track.allocation_map {
+  				fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
+  			}
+  		}
+  		if len(track.bad_free_array) > 0 {
+  			fmt.eprintf("=== %v incorrect frees: ===\n", len(track.bad_free_array))
+  			for entry in track.bad_free_array {
+  				fmt.eprintf("- %p bytes @ %v\n", entry.memory, entry.location)
+  			}
+  		}
+  		mem.tracking_allocator_destroy(&track)
+  	}
+	}
+	start()
 }
