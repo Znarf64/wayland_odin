@@ -6,7 +6,6 @@ import xdg "../../xdg"
 import zwp "../../zwp"
 import "core:fmt"
 import "core:log"
-import "core:mem"
 import "core:os"
 import "core:sys/linux"
 import "vendor:egl"
@@ -406,9 +405,16 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 }
 
 quit :: proc(conn: ^wl.Connection, state: State) {
-	if state.xdg_toplevel != 0 do xdg.toplevel_destroy(conn, state.xdg_toplevel)
-	if state.xdg_surface != 0 do xdg.surface_destroy(conn, state.xdg_surface)
-	if state.wl_surface != 0 do wl.surface_destroy(conn, state.wl_surface)
+	if state.zwp_linux_dmabuf != 0 do zwp.linux_dmabuf_v1_destroy(conn, state.zwp_linux_dmabuf)
+	if state.xdg_toplevel  != 0 do xdg.toplevel_destroy(conn, state.xdg_toplevel)
+	if state.xdg_surface   != 0 do xdg.surface_destroy(conn, state.xdg_surface)
+	if state.wl_surface    != 0 do wl.surface_destroy(  conn, state.wl_surface)
+	if state.xdg_wm_base   != 0 do xdg.wm_base_destroy(conn, state.xdg_wm_base)
+
+	for fd in conn.fds_out {
+  	linux.close(fd)
+	}
+	if state.drm_fd != 0 do linux.close(state.drm_fd)
 
 	wayl.connection_flush(conn)
 	wayl.connection_destroy(conn^)
@@ -496,26 +502,5 @@ start :: proc() {
 
 main :: proc() {
   context.logger = log.create_console_logger()
-	when ODIN_DEBUG {
-  	track: mem.Tracking_Allocator
-  	mem.tracking_allocator_init(&track, context.allocator)
-  	context.allocator = mem.tracking_allocator(&track)
-  	defer {
-  		if len(track.allocation_map) > 0 {
-  			fmt.eprintf("=== %v allocations not freed: ===\n", len(track.allocation_map))
-  			for _, entry in track.allocation_map {
-  				fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
-  			}
-  		}
-  		if len(track.bad_free_array) > 0 {
-  			fmt.eprintf("=== %v incorrect frees: ===\n", len(track.bad_free_array))
-  			for entry in track.bad_free_array {
-  				fmt.eprintf("- %p bytes @ %v\n", entry.memory, entry.location)
-  			}
-  		}
-  		mem.tracking_allocator_destroy(&track)
-  	}
-	}
 	start()
 }
-
