@@ -48,8 +48,8 @@ connection_destroy :: proc(connection: Connection) {
 }
 
 CMsg_Hdr :: struct {
-	len:          uint,
-	level, type:  i32,
+	len:         uint,
+	level, type: i32,
 }
 
 CMSG_ALIGN :: #force_inline proc "contextless" (len: $T) -> T {
@@ -65,33 +65,46 @@ CMSG_SPACE :: #force_inline proc "contextless" (data_len: $T) -> T {
 	return size_of(CMsg_Hdr) + CMSG_ALIGN(data_len)
 }
 
+
 connection_flush :: proc(connection: ^Connection) {
-  if len(connection.buffer_out) == 0 && len(connection.fds_out) == 0 do return
+	if len(connection.buffer_out) == 0 && len(connection.fds_out) == 0 do return
 
-	data := len(connection.fds_out) * size_of(linux.Fd)
-  msg := linux.Msg_Hdr{
-    iov = {{
-      base = raw_data(connection.buffer_out),
-      len = len(connection.buffer_out),
-    }},
-    control = make([]byte, CMSG_SPACE(data), context.temp_allocator),
-  }
+	control: []byte
+	if len(connection.fds_out) > 0 {
+		data := len(connection.fds_out) * size_of(linux.Fd)
+		space := CMSG_SPACE(data)
+		control_buf := make([]byte, space, context.temp_allocator)
+		control = control_buf[:space]
 
-	hdr      := cast(^CMsg_Hdr)raw_data(msg.control)
-	hdr.len   = uint(CMSG_LEN(data))
-	hdr.level = i32(linux.SOL_SOCKET)
-	hdr.type  = 1
+		hdr      := cast(^CMsg_Hdr)raw_data(control)
+		hdr.len   = uint(CMSG_LEN(data))
+		hdr.level = i32(linux.SOL_SOCKET)
+		hdr.type  = 1
 
-	copy(msg.control[size_of(CMsg_Hdr):], slice.to_bytes(connection.fds_out[:]))
-
-	_, errno := linux.sendmsg(connection.socket, &msg, { .CMSG_CLOEXEC, .NOSIGNAL, })
-	if errno == .EAGAIN {
-		return
+		copy(control[size_of(CMsg_Hdr):], slice.to_bytes(connection.fds_out[:]))
 	}
-	assert(errno == .NONE)
 
-	clear(&connection.buffer_out)
-	clear(&connection.fds_out)
+	for len(connection.buffer_out) > 0 {
+		msg := linux.Msg_Hdr {
+			iov = {{
+				base = raw_data(connection.buffer_out),
+				len = len(connection.buffer_out)
+			}},
+			control = control,
+		}
+		n, errno := linux.sendmsg(connection.socket, &msg, {.NOSIGNAL})
+		if errno == .EINTR do continue
+		if errno == .EAGAIN do continue
+		assert(errno == .NONE)
+		assert(n > 0)
+
+		msg.control = nil
+		clear(&connection.fds_out)
+
+		rest := len(connection.buffer_out) - n
+		copy(connection.buffer_out[:], connection.buffer_out[n:])
+		resize(&connection.buffer_out, rest)
+	}
 }
 
 connection_poll :: proc(connection: ^Connection) {
