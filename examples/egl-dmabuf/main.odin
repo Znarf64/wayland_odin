@@ -16,24 +16,10 @@ import gl "vendor:OpenGL"
 
 WL_DBG :: #config(WL_DBG, false)
 
-
-Dmabuf_Format_Modifier :: struct {
-	format:   u32,
-	modifier: u64,
-}
-
-Dmabuf_Tranche :: struct {
-	target_device: [8]u8,
-	flags:         zwp.Linux_Dmabuf_Feedback_V1_Tranche_Flags,
-	formats:       [dynamic]Dmabuf_Format_Modifier,
-}
-
-Dmabuf_Feedback :: struct {
-	main_device:  [8]u8,
-	format_table: [dynamic]Dmabuf_Format_Modifier,
-	tranches:     [dynamic]Dmabuf_Tranche,
-	current:      Dmabuf_Tranche,
-}
+GL_MAJOR :: 3
+GL_MINOR :: 3
+FRAME_CACHE_LEN :: 8
+MAX_LOCKED_BUFFERS :: 3
 
 State :: struct {
 	w, h:           u32,
@@ -51,12 +37,20 @@ State :: struct {
 	// EGL
 	egl_display:                         egl.Display,
 	egl_context:                         egl.Context,
+	egl_surface:                         egl.Surface,
 
 	// GBM
 	drm_fd:                              linux.Fd,
 	gbm_device:                          gbm.Device,
+	gbm_surface:                         gbm.Surface,
 	zwp_linux_dmabuf:                    zwp.Linux_Dmabuf_V1,
-	dmabuf_feedback:                     Dmabuf_Feedback,
+	frame_buffers:                       [FRAME_CACHE_LEN]Frame_Buffer
+}
+
+Frame_Buffer :: struct {
+  bo:     gbm.BufferObject,
+  buffer: wl.Buffer,
+  locked: bool
 }
 
 BufferStatus :: enum {
@@ -66,45 +60,11 @@ BufferStatus :: enum {
 	Ready,
 }
 
-Gbo :: struct {
-	bo:         gbm.BufferObject,
-	status:     BufferStatus,
-	buffer:     wl.Buffer,
-	egl_image:  egl.Image,
-	gl_texture: u32,
-	gl_fbo:     u32,
-	plane_fds:  [4]linux.Fd,
-	zwp_params: zwp.Linux_Buffer_Params_V1,
-}
-
 Status :: enum {
 	None,
 	SurfaceAckedConfigure,
 }
 
-
-BUF_LEN :: 2
-GL_MAJOR :: 3
-GL_MINOR :: 3
-gbo: #soa[BUF_LEN]Gbo
-
-
-window_next_buffer :: proc() -> (slot: int, ok: bool) {
-	for &g, i in gbo {
-		if g.status == .Ready do return i, true
-	}
-	return -1, false
-}
-
-create_buffers :: proc(conn: ^wl.Connection, st: ^State) -> bool {
-	for slot in 0 ..< BUF_LEN {
-		if !create_dmabuf_buffer(conn, st, slot) {
-			log.error("failed to create buffer at slot", slot)
-			return false
-		}
-	}
-	return true
-}
 
 create_objects :: proc(conn: ^wl.Connection, st: ^State) -> (ok: bool) {
 	wayl.connection_flush(conn)
@@ -132,9 +92,6 @@ create_objects :: proc(conn: ^wl.Connection, st: ^State) -> (ok: bool) {
 		log.error("Error in GL creation")
 		return false
 	}
-	create_err := create_buffers(conn, st)
-	if !create_err do return false
-
 	return true
 }
 
@@ -216,95 +173,78 @@ receive_events :: proc(conn: ^wl.Connection, st: ^State) -> (exit: bool) {
 		case xdg.Toplevel_Wm_Capabilities_Event:
 		case wl.Buffer_Release_Event:
 			released_buffer := e.object
-			for &e in gbo {
-				if e.buffer == released_buffer {
-					e.status = .Ready
+			for &f in st.frame_buffers {
+				if f.buffer == released_buffer && f.locked {
+					gbm.surface_release_buffer(st.gbm_surface, f.bo)
+					f.locked = false
 					break
 				}
-			}
-		case zwp.Linux_Dmabuf_Feedback_V1_Main_Device_Event:
-			clear(&st.dmabuf_feedback.tranches)
-			copy(st.dmabuf_feedback.main_device[:], e.device[:])
-			log.debug("main_device", e.device)
-		case zwp.Linux_Dmabuf_Feedback_V1_Format_Table_Event:
-			size := uint(e.size)
-			ptr, mmap_err := linux.mmap(0, size, {.READ}, {.PRIVATE}, e.fd)
-			linux.close(e.fd)
-			if mmap_err != .NONE {
-				log.error("Failed to mmap format table", mmap_err)
-				break
-			}
-			clear(&st.dmabuf_feedback.format_table)
-			count := size / 16
-			raw := mem.slice_ptr(cast(^u8)ptr, int(e.size))
-			for i in 0 ..< count {
-				base := i * 16
-				format := (^u32)(&raw[base])^
-				modifier := (^u64)(&raw[base + 8])^
-				append(&st.dmabuf_feedback.format_table, Dmabuf_Format_Modifier{format, modifier})
-			}
-			linux.munmap(ptr, size)
-		case zwp.Linux_Dmabuf_Feedback_V1_Tranche_Target_Device_Event:
-			copy(st.dmabuf_feedback.current.target_device[:], e.device[:])
-		case zwp.Linux_Dmabuf_Feedback_V1_Tranche_Flags_Event:
-			st.dmabuf_feedback.current.flags = e.flags
-
-		case zwp.Linux_Dmabuf_Feedback_V1_Tranche_Formats_Event:
-			// e.indices indexes into the mmap'd format_table, NOT a direct
-			// (format, modifier) pair itself
-			for idx in e.indices {
-				if int(idx) < len(st.dmabuf_feedback.format_table) {
-					append(
-						&st.dmabuf_feedback.current.formats,
-						st.dmabuf_feedback.format_table[idx],
-					)
-				}
-			}
-		case zwp.Linux_Dmabuf_Feedback_V1_Tranche_Done_Event:
-			append(&st.dmabuf_feedback.tranches, st.dmabuf_feedback.current)
-			// reset scratch state for next tranche
-			st.dmabuf_feedback.current = {}
-		case zwp.Linux_Dmabuf_Feedback_V1_Done_Event:
-			log.info(
-				"=== dmabuf feedback complete:",
-				len(st.dmabuf_feedback.tranches),
-				"tranches ===",
-			)
-		case zwp.Linux_Buffer_Params_V1_Created_Event:
-			found := false
-			for &b in gbo {
-				if b.zwp_params == e.object {
-					found = true
-					b.status = .Ready
-					b.buffer = e.buffer
-					b.zwp_params = 0
-					zwp.linux_buffer_params_v1_destroy(conn, e.object)
-				}
-			}
-			if !found {
-				log.error("Could not locate Gbo to associate with wl_buffer")
-				return false
-			}
-		case zwp.Linux_Buffer_Params_V1_Failed_Event:
-			found := false
-			for &b, slot in gbo {
-				if b.zwp_params == e.object {
-					log.error("Buffer creation failed for slot", slot)
-					found = true
-					b.status = .Failed
-					b.zwp_params = 0
-					zwp.linux_buffer_params_v1_destroy(conn, e.object)
-				}
-			}
-			if !found {
-				log.error("Could not locate Gbo to associate with wl_buffer")
-				return false
 			}
 		}
 	}
 	return false
 }
 
+wl_buffer_from_bo :: proc(
+	conn: ^wl.Connection,
+	st: ^State,
+	bo: gbm.BufferObject,
+) -> (
+	buffer: wl.Buffer,
+	ok: bool,
+) {
+	format := gbm.Formats.XRGB8888
+	modifier := gbm.bo_get_modifier(bo)
+	plane_count := gbm.bo_get_plane_count(bo)
+
+	params := zwp.linux_dmabuf_v1_create_params(conn, st.zwp_linux_dmabuf)
+	for plane in 0 ..< plane_count {
+		plane_fd := gbm.bo_get_fd_for_plane(bo, plane)
+		if plane_fd <= 0 {
+			log.error("bo_get_fd_for_plane failed for plane", plane)
+			zwp.linux_buffer_params_v1_destroy(conn, params)
+			return
+		}
+		zwp.linux_buffer_params_v1_add(
+			conn,
+			params,
+			auto_cast plane_fd,
+			u32(plane),
+			gbm.bo_get_offset(bo, plane),
+			gbm.bo_get_stride_for_plane(bo, plane),
+			u32(modifier >> 32),
+			u32(modifier & 0xFFFFFFFF),
+		)
+	}
+	log.debugf("importing bo format=%x modifier=%x planes=%d", u32(format), modifier, plane_count)
+	buffer = zwp.linux_buffer_params_v1_create_immed(
+		conn,
+		params,
+		i32(st.w),
+		i32(st.h),
+		u32(format),
+		{},
+	)
+	zwp.linux_buffer_params_v1_destroy(conn, params)
+	return buffer, true
+}
+
+find_frame :: proc(conn: ^wl.Connection, st: ^State, bo: gbm.BufferObject) -> ^Frame_Buffer {
+	empty: ^Frame_Buffer
+	for &frame in st.frame_buffers {
+		if frame.bo == bo do return &frame
+		if frame.bo == {} && empty == nil do empty = &frame
+	}
+	if empty == nil do return nil
+
+	buffer, ok := wl_buffer_from_bo(conn, st, bo)
+	if !ok do return nil
+	empty^ = {
+		bo     = bo,
+		buffer = buffer,
+	}
+	return empty
+}
 
 open_drm_device :: proc() -> (fd: linux.Fd, ok: bool) {
 	render_nodes := []cstring {
@@ -326,13 +266,30 @@ open_drm_device :: proc() -> (fd: linux.Fd, ok: bool) {
 	return 0, false
 }
 
-/* 
-  Info may be found in Mesa's implementation at src/egl/drivers/dri2/platform_wayland.c"
- * https://ziggit.dev/t/drawing-with-opengl-without-glfw-or-sdl-on-linux/3175/12
- * https://blaztinn.gitlab.io/post/dmabuf-texture-sharing/
- */
-
-// https://registry.khronos.org/EGL/sdk/docs/man/html/eglIntro.xhtml
+choose_config :: proc(st: ^State) -> (config: egl.Config, ok: bool) {
+	attribs := []i32 {
+		egl.SURFACE_TYPE, egl.WINDOW_BIT,
+		egl.RENDERABLE_TYPE, egl.OPENGL_BIT,
+		egl.RED_SIZE, 8,
+		egl.GREEN_SIZE, 8,
+		egl.BLUE_SIZE, 8,
+		egl.NONE,
+	}
+	MAX_CONFIGS :: 256
+	configs: [MAX_CONFIGS]egl.Config
+	config_count: i32
+	if !egl.ChooseConfig(st.egl_display, &attribs[0], &configs[0], MAX_CONFIGS, &config_count) {
+		return
+	}
+	for candidate in configs[:config_count] {
+		visual_id: i32
+		egl.GetConfigAttrib(st.egl_display, candidate, egl.NATIVE_VISUAL_ID, &visual_id)
+		if u32(visual_id) == u32(gbm.Formats.XRGB8888) {
+			return candidate, true
+		}
+	}
+	return
+}
 
 create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	st.drm_fd = open_drm_device() or_return
@@ -363,84 +320,60 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 		log.error("eglQueryString(EGL_EXTENSIONS) returned empty")
 		return false
 	}
-	if !egl.has_egl_extension(extensions, "EGL_EXT_image_dma_buf_import") {
-		log.error("EGL_EXT_image_dma_buf_import not supported")
-		return false
-	}
-	if !egl.has_egl_extension(extensions, "EGL_KHR_surfaceless_context") {
-		log.error("EGL_KHR_surfaceless_context not supported")
-		return false
-	}
 
-	has_no_config := egl.has_egl_extension(extensions, "EGL_KHR_no_config_context")
-	egl_config := egl.NO_CONFIG_KHR
-	if !has_no_config {
-		log.warn("EGL_KHR_no_config_context not supported")
-		config_attribs := []i32 {
-			egl.RENDERABLE_TYPE, egl.OPENGL_BIT,
-			egl.RED_SIZE,        8,
-			egl.GREEN_SIZE,      8,
-			egl.BLUE_SIZE,       8,
-			egl.NONE,
-		}
-		MAX_CONFIGS :: 256
-		configs: [MAX_CONFIGS]egl.Config
-		num_configs: i32
-
-		if !egl.ChooseConfig(
-			st.egl_display,
-			&config_attribs[0],
-			&configs[0],
-			MAX_CONFIGS,
-			&num_configs,
-		) {
-			log.error("Failed to choose egl config")
-			return false
-		}
-		log.debug("configs matched: ", num_configs)
-
-		found := false
-		for i in 0 ..< num_configs {
-			visual_id: i32
-			egl.GetConfigAttrib(st.egl_display, configs[i], egl.NATIVE_VISUAL_ID, &visual_id)
-			if u32(visual_id) == u32(gbm.Formats.XRGB8888) {
-				egl_config = configs[i]
-				found = true
-				break
-			}
-		}
-		if !found {
-			log.error("unable to find matching egl config")
-			return false
-		}
+	egl_config, config_ok := choose_config(st)
+	if !config_ok {
+  	log.error("unable to find matching egl config")
+  	return false
 	}
 
 	if !egl.BindAPI(egl.OPENGL_API) {
-		log.error("Bind API failed")
-		return false
+  	log.error("Bind API failed")
+  	return false
 	}
 
 	context_attribs := []i32 {
-		egl.CONTEXT_MAJOR_VERSION, GL_MAJOR,
-		egl.CONTEXT_MINOR_VERSION, GL_MINOR,
-		egl.NONE,
+  	egl.CONTEXT_MAJOR_VERSION, GL_MAJOR,
+  	egl.CONTEXT_MINOR_VERSION, GL_MINOR,
+  	egl.NONE
 	}
-
-	st.egl_context = egl.CreateContext(
-		st.egl_display,
-		egl_config,
-		egl.NO_CONTEXT,
-		&context_attribs[0],
+	st.egl_context = egl.CreateContext(st.egl_display,
+  	egl_config,
+  	egl.NO_CONTEXT,
+  	&context_attribs[0],
 	)
-	if (st.egl_context == egl.NO_CONTEXT) {
-		log.error("egl_context creation failed:", egl.get_error())
-		return false
-	}
-	log.debug(st.egl_context, "egl_context created")
 
-	if !egl.MakeCurrent(st.egl_display, egl.NO_SURFACE, egl.NO_SURFACE, st.egl_context) {
-		log.error("eglMakeCurrent (surfaceless) failed", egl.get_error())
-		return false
+	if st.egl_context == egl.NO_CONTEXT {
+		log.error("egl_context creation failed:", egl.get_error())
+  	return false
+	}
+
+	st.gbm_surface = gbm.surface_create(
+  	st.gbm_device,
+  	st.w,
+  	st.h,
+  	gbm.Formats.XRGB8888,
+  	{.USE_RENDERING, .USE_SCANOUT},
+	)
+	if st.gbm_surface == {} {
+  	log.error("gbm_surface_create failed")
+  	return false
+	}
+
+	st.egl_surface = egl.CreatePlatformWindowSurface(
+  	st.egl_display,
+  	egl_config,
+  	st.gbm_surface,
+  	{},
+	)
+	if st.egl_surface == egl.NO_SURFACE {
+		log.error("egl_surface creation failed:", egl.get_error())
+  	return false
+	}
+
+	if !egl.MakeCurrent(st.egl_display, st.egl_surface, st.egl_surface, st.egl_context) {
+		log.error("eglMakeCurrent failed:", egl.get_error())
+  	return false
 	}
 
 	egl.load_extensions()
@@ -464,211 +397,6 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	log.info("\n========= OPENGL READY ============\n")
 	return true
 }
-// Creates surfaceless egl context ( see https://fossies.org/linux/weston/clients/simple-egl.c)
-// for reference implementation. There is a simpler method using EGLSurface on a gbm_surface presented
-// wth eglSwapBuffers then gbm_surface_lock_front_buffer. This gives Mesa control of the buffer queue, modifiers,
-// and buffer lifetimes, and releases you from managing the swapchain. In the process of debugging, DO NOT EVER call
-// connection_poll or receive_events for zwp.linux_buffer_params_v1_create buffers one at a time, the author made a
-// switch to surfaceless and saw no reason to attempt going back afterwards.
-create_dmabuf_buffer :: proc(conn: ^wl.Connection, st: ^State, slot: int) -> bool {
-	format := gbm.Formats.XRGB8888
-
-	// Gather tranche-advertised modifiers for this format .
-	mods: [dynamic]u64
-	defer delete(mods)
-	for tranche in st.dmabuf_feedback.tranches {
-		for fm in tranche.formats {
-			if fm.format == u32(format) {
-				append(&mods, fm.modifier)
-			}
-		}
-	}
-
-	// egl intersection
-	egl_mods: [dynamic]u64
-	defer delete(egl_mods)
-	assert(egl.QueryDmaBufModifiersEXT != nil)
-	
-	max_mods: i32 = 64
-	egl_mod_array: [64]u64
-	num_egl_mods: i32
-	egl.QueryDmaBufModifiersEXT(
-		st.egl_display,
-		i32(format),
-		max_mods,
-		&egl_mod_array[0],
-		nil,
-		&num_egl_mods,
-	)
-
-	for comp_mod in mods {
-		for egl_mod in egl_mod_array[:num_egl_mods] {
-			if comp_mod == egl_mod {
-				append(&egl_mods, comp_mod)
-				break
-			}
-		}
-	}
-
-	bo: gbm.BufferObject
-	if len(egl_mods) > 0 {
-		bo = gbm.bo_create_with_modifiers2(
-			st.gbm_device,
-			st.w,
-			st.h,
-			format,
-			raw_data(egl_mods),
-			u32(len(egl_mods)),
-			{.USE_RENDERING},
-		)
-	}
-
-	if bo == {} {
-		bo = gbm.bo_create(st.gbm_device, st.w, st.h, format, {.USE_RENDERING})
-	}
-	if bo == {} {
-		log.error("gbm_bo_create failed for slot", slot)
-		return false
-	}
-
-	modifier := gbm.bo_get_modifier(bo)
-	plane_count := gbm.bo_get_plane_count(bo)
-	if plane_count > 4 {
-		log.error("plane_count", plane_count, "exceeds MAX_BUFFER_PLANES (4)")
-		return false
-	}
-
-	fds_to_close_on_failure: [dynamic]i32
-	defer {
-		for fd in fds_to_close_on_failure {
-			linux.close(linux.Fd(fd))
-		}
-		delete(fds_to_close_on_failure)
-	}
-
-	zwp_params := zwp.linux_dmabuf_v1_create_params(conn, st.zwp_linux_dmabuf)
-	plane_fds: [4]linux.Fd
-	offsets, strides: [4]u32
-	for plane in 0 ..< plane_count {
-		offset := gbm.bo_get_offset(bo, plane)
-		stride := gbm.bo_get_stride_for_plane(bo, plane)
-		plane_fd := gbm.bo_get_fd_for_plane(bo, plane)
-		if plane_fd <= 0 {
-			log.error("bo_get_fd_for_plane failed for plane", plane)
-			return false
-		}
-		append(&fds_to_close_on_failure, plane_fd)
-		plane_fds[plane] = linux.Fd(plane_fd)
-		offsets[plane] = offset
-		strides[plane] = stride
-
-		zwp.linux_buffer_params_v1_add(
-			conn,
-			zwp_params,
-			auto_cast plane_fd,
-			u32(plane),
-			offset,
-			stride,
-			u32(modifier >> 32),
-			u32(modifier & 0xFFFFFFFF),
-		)
-	}
-
-	zwp.linux_buffer_params_v1_create(conn, zwp_params, i32(st.w), i32(st.h), u32(format), {})
-
-	// --- EGLImage import, using the SAME fds just sent to the compositor ---
-	attribs: [6 + 4 * 10 + 1]i32
-	i := 0
-	attribs[i] = egl.WIDTH;                i += 1; attribs[i] = i32(st.w);   i += 1
-	attribs[i] = egl.HEIGHT;               i += 1; attribs[i] = i32(st.h);   i += 1
-	attribs[i] = egl.LINUX_DRM_FOURCC_EXT; i += 1; attribs[i] = i32(format); i += 1
-
-	plane_fd_attrs := [4]i32 {
-		egl.DMA_BUF_PLANE0_FD_EXT,
-		egl.DMA_BUF_PLANE1_FD_EXT,
-		egl.DMA_BUF_PLANE2_FD_EXT,
-		egl.DMA_BUF_PLANE3_FD_EXT,
-	}
-	plane_offset_attrs := [4]i32 {
-		egl.DMA_BUF_PLANE0_OFFSET_EXT,
-		egl.DMA_BUF_PLANE1_OFFSET_EXT,
-		egl.DMA_BUF_PLANE2_OFFSET_EXT,
-		egl.DMA_BUF_PLANE3_OFFSET_EXT,
-	}
-	plane_pitch_attrs := [4]i32 {
-		egl.DMA_BUF_PLANE0_PITCH_EXT,
-		egl.DMA_BUF_PLANE1_PITCH_EXT,
-		egl.DMA_BUF_PLANE2_PITCH_EXT,
-		egl.DMA_BUF_PLANE3_PITCH_EXT,
-	}
-	plane_mod_lo_attrs := [4]i32 {
-		egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-		egl.DMA_BUF_PLANE1_MODIFIER_LO_EXT,
-		egl.DMA_BUF_PLANE2_MODIFIER_LO_EXT,
-		egl.DMA_BUF_PLANE3_MODIFIER_LO_EXT,
-	}
-	plane_mod_hi_attrs := [4]i32 {
-		egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-		egl.DMA_BUF_PLANE1_MODIFIER_HI_EXT,
-		egl.DMA_BUF_PLANE2_MODIFIER_HI_EXT,
-		egl.DMA_BUF_PLANE3_MODIFIER_HI_EXT,
-	}
-
-	for plane in 0 ..< plane_count {
-		attribs[i] = plane_fd_attrs[plane];     i += 1; attribs[i] = i32(plane_fds[plane]);      i += 1
-		attribs[i] = plane_offset_attrs[plane]; i += 1; attribs[i] = i32(offsets[plane]);        i += 1
-		attribs[i] = plane_pitch_attrs[plane];  i += 1; attribs[i] = i32(strides[plane]);        i += 1
-		attribs[i] = plane_mod_lo_attrs[plane]; i += 1; attribs[i] = i32(modifier & 0xFFFFFFFF); i += 1
-		attribs[i] = plane_mod_hi_attrs[plane]; i += 1; attribs[i] = i32(modifier >> 32);        i += 1
-	}
-	attribs[i] = egl.NONE
-
-	image := egl.CreateImageKHR(
-		st.egl_display,
-		egl.NO_CONTEXT,
-		egl.LINUX_DMA_BUF_EXT,
-		nil,
-		&attribs[0],
-	)
-	if image == egl.NO_IMAGE_KHR {
-		log.error("eglCreateImageKHR failed for slot", slot, ":", egl.get_error())
-		return false
-	}
-
-	tex, fbo: u32
-	gl.GenTextures(1, &tex)
-	gl.BindTexture(gl.TEXTURE_2D, tex)
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-	// inverts y coordinate to top-down. available on opengl > 4.5
-	// gl.ClipControl(gl.UPPER_LEFT, gl.ZERO_TO_ONE)
-	egl.EGLImageTargetTexture2DOES(gl.TEXTURE_2D, image)
-
-	gl.GenFramebuffers(1, &fbo)
-	gl.BindFramebuffer(gl.FRAMEBUFFER, fbo)
-	gl.FramebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
-	if gl.CheckFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE {
-		log.error("FBO incomplete for slot", slot)
-		egl.DestroyImageKHR(st.egl_display, image)
-		return false
-	}
-
-	// success — ownership moves to gbo[slot].
-	clear(&fds_to_close_on_failure)
-	gbo[slot] = Gbo {
-		bo         = bo,
-		buffer     = 0,
-		egl_image  = image,
-		gl_texture = tex,
-		gl_fbo     = fbo,
-		plane_fds  = plane_fds,
-		status     = .Initialized,
-		zwp_params = zwp_params,
-	}
-	return true
-}
 
 quit :: proc(conn: ^wl.Connection, state: State) {
 	if state.xdg_toplevel != 0 do xdg.toplevel_destroy(conn, state.xdg_toplevel)
@@ -678,35 +406,49 @@ quit :: proc(conn: ^wl.Connection, state: State) {
 	wayl.connection_flush(conn)
 	wayl.connection_destroy(conn^)
 
-	for t in state.dmabuf_feedback.tranches {
-  	delete(t.formats)
-	}
-	delete(state.dmabuf_feedback.format_table)
-	delete(state.dmabuf_feedback.tranches)
-
 	linux.close(conn.socket)
 	log.info("closed safely")
 }
+
 tick := 0
 draw :: proc(conn: ^wl.Connection, st: ^State) {
-	slot, ok := window_next_buffer()
-	if !ok do return 
+  count := 0
+	for frame in st.frame_buffers {
+		if frame.locked do count += 1
+	}
+	if count >= MAX_LOCKED_BUFFERS do return
 
-	gl.BindFramebuffer(gl.FRAMEBUFFER, gbo[slot].gl_fbo)
+	gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
 	gl.Viewport(0, 0, i32(st.w), i32(st.h))
 
 	shade := f32(tick % 120) / 120
 	gl.ClearColor(shade, 0.67, 1-shade, 1)
 	tick += 1
 	gl.Clear(gl.COLOR_BUFFER_BIT)
-	gl.Flush()
+
+	if !egl.SwapBuffers(st.egl_display, st.egl_surface) {
+		log.error("eglSwapBuffers failed:", egl.get_error())
+		return
+	}
+	bo := gbm.surface_lock_front_buffer(st.gbm_surface)
+	if bo == {} {
+		log.error("gbm_surface_lock_front_buffer failed")
+		return
+	}
+
+	frame := find_frame(conn, st, bo)
+	if frame == nil {
+  	gbm.surface_release_buffer(st.gbm_surface, bo)
+  	return
+	}
+
+	frame.locked = true
 
 	wl.surface_frame(conn, st.wl_surface)
-	wl.surface_attach(conn, st.wl_surface, gbo[slot].buffer, 0, 0)
+	wl.surface_attach(conn, st.wl_surface, frame.buffer, 0, 0)
 	wl.surface_damage_buffer(conn, st.wl_surface, 0, 0, i32(st.w), i32(st.h))
 	wl.surface_commit(conn, st.wl_surface)
 
-	gbo[slot].status = .Busy
 	st.should_redraw = false
 }
 
