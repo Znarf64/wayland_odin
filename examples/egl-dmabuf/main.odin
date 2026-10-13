@@ -9,7 +9,7 @@ import "core:log"
 import "core:mem"
 import "core:os"
 import "core:sys/linux"
-import "egl"
+import "vendor:egl"
 import "gbm"
 import gl "vendor:OpenGL"
 
@@ -64,7 +64,29 @@ Status :: enum {
 	None,
 	SurfaceAckedConfigure,
 }
-
+EGL_Error :: enum i32 {
+	SUCCESS             = 0x3000,
+	NOT_INITIALIZED     = 0x3001,
+	BAD_ACCESS          = 0x3002,
+	BAD_ALLOC           = 0x3003,
+	BAD_ATTRIBUTE       = 0x3004,
+	BAD_CONFIG          = 0x3005,
+	BAD_CONTEXT         = 0x3006,
+	BAD_CURRENT_SURFACE = 0x3007,
+	BAD_DISPLAY         = 0x3008,
+	BAD_MATCH           = 0x3009,
+	BAD_NATIVE_PIXMAP   = 0x300A,
+	BAD_NATIVE_WINDOW   = 0x300B,
+	BAD_PARAMETER       = 0x300C,
+	BAD_SURFACE         = 0x300D,
+	CONTEXT_LOST        = 0x300E,
+}
+egl_get_error :: proc() -> EGL_Error {
+	return EGL_Error(egl.GetError())
+}
+egl_set_proc_address :: proc(p: rawptr, name: cstring) {
+	(^rawptr)(p)^ = egl.GetProcAddress(name)
+}
 
 create_objects :: proc(conn: ^wl.Connection, st: ^State) -> (ok: bool) {
 	wayl.connection_flush(conn)
@@ -216,7 +238,6 @@ wl_buffer_from_bo :: proc(
 			u32(modifier & 0xFFFFFFFF),
 		)
 	}
-	log.debugf("importing bo format=%x modifier=%x planes=%d", u32(format), modifier, plane_count)
 	buffer = zwp.linux_buffer_params_v1_create_immed(
 		conn,
 		params,
@@ -314,7 +335,7 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	}
 	log.infof("EGLv%i.%i Initialized", major, minor)
 
-	extensions := string(egl.QueryString(st.egl_display, egl.EXTENSTIONS))
+	extensions := string(egl.QueryString(st.egl_display, egl.EXTENSIONS))
 
 	if extensions == "" {
 		log.error("eglQueryString(EGL_EXTENSIONS) returned empty")
@@ -344,7 +365,7 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 	)
 
 	if st.egl_context == egl.NO_CONTEXT {
-		log.error("egl_context creation failed:", egl.get_error())
+		log.error("egl_context creation failed:", egl_get_error())
   	return false
 	}
 
@@ -367,30 +388,16 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
   	{},
 	)
 	if st.egl_surface == egl.NO_SURFACE {
-		log.error("egl_surface creation failed:", egl.get_error())
+		log.error("egl_surface creation failed:", egl_get_error())
   	return false
 	}
 
 	if !egl.MakeCurrent(st.egl_display, st.egl_surface, st.egl_surface, st.egl_context) {
-		log.error("eglMakeCurrent failed:", egl.get_error())
+		log.error("eglMakeCurrent failed:", egl_get_error())
   	return false
 	}
 
-	egl.load_extensions()
-	if egl.CreateImageKHR == nil || egl.DestroyImageKHR == nil {
-		log.error("eglCreateImageKHR/eglDestroyImageKHR not available")
-		return false
-	}
-	if egl.EGLImageTargetTexture2DOES == nil {
-		log.error("glEGLImageTargetTexture2DOES not available")
-		return false
-	}
-
-	if egl.has_egl_extension(extensions, "EGL_EXT_image_dma_buf_import_modifiers") &&
-	   egl.QueryDmaBufModifiersEXT == nil {
-		log.warn("EGL_EXT_image_dma_buf_import_modifiers advertised but proc load failed")
-	}
-	gl.load_up_to(GL_MAJOR, GL_MINOR, egl.set_proc_address)
+	gl.load_up_to(GL_MAJOR, GL_MINOR, egl_set_proc_address)
 	log.infof("OpenGL %s", gl.GetString(gl.VERSION))
 	log.infof("Renderer: %s", gl.GetString(gl.RENDERER))
 
@@ -427,7 +434,7 @@ draw :: proc(conn: ^wl.Connection, st: ^State) {
 	gl.Clear(gl.COLOR_BUFFER_BIT)
 
 	if !egl.SwapBuffers(st.egl_display, st.egl_surface) {
-		log.error("eglSwapBuffers failed:", egl.get_error())
+		log.error("eglSwapBuffers failed:", egl_get_error())
 		return
 	}
 	bo := gbm.surface_lock_front_buffer(st.gbm_surface)
@@ -511,3 +518,4 @@ main :: proc() {
 	}
 	start()
 }
+
