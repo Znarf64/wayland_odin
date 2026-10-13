@@ -47,23 +47,42 @@ connection_destroy :: proc(connection: Connection) {
 	delete(connection.free_ids)
 }
 
-connection_flush :: proc(connection: ^Connection) {
-	msg := linux.Msg_Hdr {
-		iov = {
-			{
-				base = raw_data(connection.buffer_out),
-				len  = len(connection.buffer_out),
-			},
-		},
-		control = make([]byte, 16 + ((len(connection.fds_out) + 7) & -8) * 4, context.temp_allocator),
-	}
+CMsg_Hdr :: struct {
+	len:          uint,
+	level, type:  i32,
+}
 
-	hdr      := cast(^struct { len: u64, level, type: i32 })raw_data(msg.control)
-	hdr.len   = u64(len(msg.control))
+CMSG_ALIGN :: #force_inline proc "contextless" (len: $T) -> T {
+	align :: int(size_of(uint) - 1)
+	return (len + align) & ~align
+}
+
+CMSG_LEN :: #force_inline proc "contextless" (data_len: int) -> int {
+	return size_of(CMsg_Hdr) + data_len
+}
+
+CMSG_SPACE :: #force_inline proc "contextless" (data_len: $T) -> T {
+	return size_of(CMsg_Hdr) + CMSG_ALIGN(data_len)
+}
+
+connection_flush :: proc(connection: ^Connection) {
+  if len(connection.buffer_out) == 0 && len(connection.fds_out) == 0 do return
+
+	data := len(connection.fds_out) * size_of(linux.Fd)
+  msg := linux.Msg_Hdr{
+    iov = {{
+      base = raw_data(connection.buffer_out),
+      len = len(connection.buffer_out),
+    }},
+    control = make([]byte, CMSG_SPACE(data), context.temp_allocator),
+  }
+
+	hdr      := cast(^CMsg_Hdr)raw_data(msg.control)
+	hdr.len   = uint(CMSG_LEN(data))
 	hdr.level = i32(linux.SOL_SOCKET)
 	hdr.type  = 1
 
-	copy(msg.control[16:], slice.to_bytes(connection.fds_out[:]))
+	copy(msg.control[size_of(CMsg_Hdr):], slice.to_bytes(connection.fds_out[:]))
 
 	_, errno := linux.sendmsg(connection.socket, &msg, { .CMSG_CLOEXEC, .NOSIGNAL, })
 	if errno == .EAGAIN {
