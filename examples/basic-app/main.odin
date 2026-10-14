@@ -4,10 +4,10 @@ import "core:sys/linux"
 import "core:fmt"
 import "core:os"
 
-import wayland  ".."
-import wl       "../wl"
-import wp       "../wp"
-import xdg      "../xdg"
+import wayland  "../.."
+import wl       "../../wl"
+import wp       "../../wp"
+import xdg      "../../xdg"
 
 main :: proc() {
 	socket := linux.socket(.UNIX, .STREAM, { .CLOEXEC, }, {}) or_else panic("")
