@@ -8,9 +8,9 @@ import "core:fmt"
 import "core:log"
 import "core:os"
 import "core:sys/linux"
-import "vendor:egl"
 import "gbm"
 import gl "vendor:OpenGL"
+import "vendor:egl"
 
 
 WL_DBG :: #config(WL_DBG, false)
@@ -21,35 +21,35 @@ FRAME_CACHE_LEN :: 8
 MAX_LOCKED_BUFFERS :: 3
 
 State :: struct {
-	w, h:           u32,
-	should_redraw: bool,
-	status:                              Status,
+	w, h:             u32,
+	should_redraw:    bool,
+	status:           Status,
 
 	// WL
-	wl_registry:                         wl.Registry,
-	xdg_wm_base:                         xdg.Wm_Base,
-	xdg_surface:                         xdg.Surface,
-	wl_surface:                          wl.Surface,
-	wl_compositor:                       wl.Compositor,
-	xdg_toplevel:                        xdg.Toplevel,
+	wl_registry:      wl.Registry,
+	xdg_wm_base:      xdg.Wm_Base,
+	xdg_surface:      xdg.Surface,
+	wl_surface:       wl.Surface,
+	wl_compositor:    wl.Compositor,
+	xdg_toplevel:     xdg.Toplevel,
 
 	// EGL
-	egl_display:                         egl.Display,
-	egl_context:                         egl.Context,
-	egl_surface:                         egl.Surface,
+	egl_display:      egl.Display,
+	egl_context:      egl.Context,
+	egl_surface:      egl.Surface,
 
 	// GBM
-	drm_fd:                              linux.Fd,
-	gbm_device:                          gbm.Device,
-	gbm_surface:                         gbm.Surface,
-	zwp_linux_dmabuf:                    zwp.Linux_Dmabuf_V1,
-	frame_buffers:                       [FRAME_CACHE_LEN]Frame_Buffer
+	drm_fd:           linux.Fd,
+	gbm_device:       gbm.Device,
+	gbm_surface:      gbm.Surface,
+	zwp_linux_dmabuf: zwp.Linux_Dmabuf_V1,
+	frame_buffers:    [FRAME_CACHE_LEN]Frame_Buffer,
 }
 
 Frame_Buffer :: struct {
-  bo:     gbm.BufferObject,
-  buffer: wl.Buffer,
-  locked: bool
+	bo:     gbm.BufferObject,
+	buffer: wl.Buffer,
+	locked: bool,
 }
 
 BufferStatus :: enum {
@@ -288,11 +288,11 @@ open_drm_device :: proc() -> (fd: linux.Fd, ok: bool) {
 
 choose_config :: proc(st: ^State) -> (config: egl.Config, ok: bool) {
 	attribs := []i32 {
-		egl.SURFACE_TYPE, egl.WINDOW_BIT,
+		egl.SURFACE_TYPE,    egl.WINDOW_BIT,
 		egl.RENDERABLE_TYPE, egl.OPENGL_BIT,
-		egl.RED_SIZE, 8,
-		egl.GREEN_SIZE, 8,
-		egl.BLUE_SIZE, 8,
+		egl.RED_SIZE,        8,
+		egl.GREEN_SIZE,      8,
+		egl.BLUE_SIZE,       8,
 		egl.NONE,
 	}
 	MAX_CONFIGS :: 256
@@ -343,57 +343,58 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 
 	egl_config, config_ok := choose_config(st)
 	if !config_ok {
-  	log.error("unable to find matching egl config")
-  	return false
+		log.error("unable to find matching egl config")
+		return false
 	}
 
 	if !egl.BindAPI(egl.OPENGL_API) {
-  	log.error("Bind API failed")
-  	return false
+		log.error("Bind API failed")
+		return false
 	}
 
 	context_attribs := []i32 {
-  	egl.CONTEXT_MAJOR_VERSION, GL_MAJOR,
-  	egl.CONTEXT_MINOR_VERSION, GL_MINOR,
-  	egl.NONE
+		egl.CONTEXT_MAJOR_VERSION, GL_MAJOR,
+		egl.CONTEXT_MINOR_VERSION, GL_MINOR,
+		egl.NONE,
 	}
-	st.egl_context = egl.CreateContext(st.egl_display,
-  	egl_config,
-  	egl.NO_CONTEXT,
-  	&context_attribs[0],
+	st.egl_context = egl.CreateContext(
+		st.egl_display,
+		egl_config,
+		egl.NO_CONTEXT,
+		&context_attribs[0],
 	)
 
 	if st.egl_context == egl.NO_CONTEXT {
 		log.error("egl_context creation failed:", egl_get_error())
-  	return false
+		return false
 	}
 
 	st.gbm_surface = gbm.surface_create(
-  	st.gbm_device,
-  	st.w,
-  	st.h,
-  	gbm.Formats.XRGB8888,
-  	{.USE_RENDERING, .USE_SCANOUT},
+		st.gbm_device,
+		st.w,
+		st.h,
+		gbm.Formats.XRGB8888,
+		{.USE_RENDERING, .USE_SCANOUT},
 	)
 	if st.gbm_surface == {} {
-  	log.error("gbm_surface_create failed")
-  	return false
+		log.error("gbm_surface_create failed")
+		return false
 	}
 
 	st.egl_surface = egl.CreatePlatformWindowSurface(
-  	st.egl_display,
-  	egl_config,
-  	st.gbm_surface,
-  	{},
+		st.egl_display,
+		egl_config,
+		st.gbm_surface,
+		{},
 	)
 	if st.egl_surface == egl.NO_SURFACE {
 		log.error("egl_surface creation failed:", egl_get_error())
-  	return false
+		return false
 	}
 
 	if !egl.MakeCurrent(st.egl_display, st.egl_surface, st.egl_surface, st.egl_context) {
 		log.error("eglMakeCurrent failed:", egl_get_error())
-  	return false
+		return false
 	}
 
 	gl.load_up_to(GL_MAJOR, GL_MINOR, egl_set_proc_address)
@@ -406,13 +407,13 @@ create_display :: proc(conn: ^wayl.Connection, st: ^State) -> bool {
 
 quit :: proc(conn: ^wl.Connection, state: State) {
 	if state.zwp_linux_dmabuf != 0 do zwp.linux_dmabuf_v1_destroy(conn, state.zwp_linux_dmabuf)
-	if state.xdg_toplevel  != 0 do xdg.toplevel_destroy(conn, state.xdg_toplevel)
-	if state.xdg_surface   != 0 do xdg.surface_destroy(conn, state.xdg_surface)
-	if state.wl_surface    != 0 do wl.surface_destroy(  conn, state.wl_surface)
-	if state.xdg_wm_base   != 0 do xdg.wm_base_destroy(conn, state.xdg_wm_base)
+	if state.xdg_toplevel     != 0 do xdg.toplevel_destroy(conn, state.xdg_toplevel)
+	if state.xdg_surface      != 0 do xdg.surface_destroy(conn, state.xdg_surface)
+	if state.wl_surface       != 0 do wl.surface_destroy(conn, state.wl_surface)
+	if state.xdg_wm_base      != 0 do xdg.wm_base_destroy(conn, state.xdg_wm_base)
 
 	for fd in conn.fds_out {
-  	linux.close(fd)
+		linux.close(fd)
 	}
 	if state.drm_fd != 0 do linux.close(state.drm_fd)
 
@@ -425,7 +426,7 @@ quit :: proc(conn: ^wl.Connection, state: State) {
 
 tick := 0
 draw :: proc(conn: ^wl.Connection, st: ^State) {
-  count := 0
+	count := 0
 	for frame in st.frame_buffers {
 		if frame.locked do count += 1
 	}
@@ -435,7 +436,7 @@ draw :: proc(conn: ^wl.Connection, st: ^State) {
 	gl.Viewport(0, 0, i32(st.w), i32(st.h))
 
 	shade := f32(tick % 120) / 120
-	gl.ClearColor(shade, 0.67, 1-shade, 1)
+	gl.ClearColor(shade, 0.67, 1 - shade, 1)
 	tick += 1
 	gl.Clear(gl.COLOR_BUFFER_BIT)
 
@@ -451,8 +452,8 @@ draw :: proc(conn: ^wl.Connection, st: ^State) {
 
 	frame := find_frame(conn, st, bo)
 	if frame == nil {
-  	gbm.surface_release_buffer(st.gbm_surface, bo)
-  	return
+		gbm.surface_release_buffer(st.gbm_surface, bo)
+		return
 	}
 
 	frame.locked = true
@@ -489,18 +490,19 @@ start :: proc() {
 
 	m: for {
 		wayl.connection_flush(&conn)
-	
-		if ready, _ := linux.poll({linux.Poll_Fd{fd = conn.socket, events = {.IN}}}, 2); ready > 0 {
+
+		if ready, _ := linux.poll({linux.Poll_Fd{fd = conn.socket, events = {.IN}}}, 2);
+		   ready > 0 {
 			wayl.connection_poll(&conn)
 			if receive_events(&conn, &st) do return
 		}
-	
+
 		if st.status == .None do continue
 		if st.should_redraw do draw(&conn, &st)
 	}
 }
 
 main :: proc() {
-  context.logger = log.create_console_logger()
+	context.logger = log.create_console_logger()
 	start()
 }
