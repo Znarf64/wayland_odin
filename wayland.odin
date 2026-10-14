@@ -47,29 +47,49 @@ connection_destroy :: proc(connection: Connection) {
 	delete(connection.free_ids)
 }
 
+// cmsg stuff would have to be adjusted for 32-bit
+#assert(size_of(rawptr) == 8)
+
+CMsg_Hdr :: struct {
+	len:         u64,
+	level, type: i32,
+}
+
 connection_flush :: proc(connection: ^Connection) {
-	msg := linux.Msg_Hdr {
-		iov = {
-			{
-				base = raw_data(connection.buffer_out),
-				len  = len(connection.buffer_out),
+	control: []u8
+	if len(connection.fds_out) != 0 {
+		control = make([]byte, size_of(CMsg_Hdr) + ((len(connection.fds_out) + 1) & -2) * size_of(u32), context.temp_allocator)
+
+		hdr      := cast(^CMsg_Hdr)raw_data(control)
+		hdr.len   = size_of(CMsg_Hdr) + u64(len(connection.fds_out)) * 4
+		hdr.level = i32(linux.SOL_SOCKET)
+		hdr.type  = 1
+
+		copy(control[size_of(CMsg_Hdr):], slice.to_bytes(connection.fds_out[:]))
+	}
+
+	sent := 0
+	for sent < len(connection.buffer_out) {
+		msg := linux.Msg_Hdr {
+			iov = {
+				{
+					base = raw_data(connection.buffer_out[sent:]),
+					len  = len(connection.buffer_out) - uint(sent),
+				},
 			},
-		},
-		control = make([]byte, 16 + ((len(connection.fds_out) + 7) & -8) * 4, context.temp_allocator),
+			control = control,
+		}
+
+		n, errno := linux.sendmsg(connection.socket, &msg, { .CMSG_CLOEXEC, .NOSIGNAL, })
+		if errno == .EAGAIN {
+			assert(sent == 0, "TODO")
+			return
+		}
+		assert(errno == .NONE)
+
+		control = {}
+		sent   += n
 	}
-
-	hdr      := cast(^struct { len: u64, level, type: i32 })raw_data(msg.control)
-	hdr.len   = u64(len(msg.control))
-	hdr.level = i32(linux.SOL_SOCKET)
-	hdr.type  = 1
-
-	copy(msg.control[16:], slice.to_bytes(connection.fds_out[:]))
-
-	_, errno := linux.sendmsg(connection.socket, &msg, { .CMSG_CLOEXEC, .NOSIGNAL, })
-	if errno == .EAGAIN {
-		return
-	}
-	assert(errno == .NONE)
 
 	clear(&connection.buffer_out)
 	clear(&connection.fds_out)
@@ -82,9 +102,9 @@ connection_poll :: proc(connection: ^Connection) {
 
 	msg: linux.Msg_Hdr = {
 		iov     = { transmute(linux.IO_Vec)connection.buffer_in[connection.end_in:], },
-		control = make([]byte, 16 + 8 * 4, context.temp_allocator),
+		control = make([]byte, size_of(CMsg_Hdr) + 8 * 4, context.temp_allocator),
 	}
-	hdr      := cast(^struct { len: u64, level, type: i32 })raw_data(msg.control)
+	hdr      := cast(^CMsg_Hdr)raw_data(msg.control)
 	hdr.len   = u64(len(msg.control))
 	hdr.level = i32(linux.SOL_SOCKET)
 	hdr.type  = 1
